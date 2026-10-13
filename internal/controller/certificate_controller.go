@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,6 +35,8 @@ type CertificateController struct {
 	certificateInformer cache.SharedIndexInformer
 	secretInformer      cache.SharedIndexInformer
 }
+
+const maxKongTagLength = 128
 
 func NewCertificateController(
 	kubeClient kubernetes.Interface,
@@ -524,22 +527,85 @@ func uniqueStrings(slice []string) []string {
 }
 
 func (c *CertificateController) generateTags(namespace, name string, cert *certmanagerv1.Certificate) []string {
-	tags := []string{
-		"managed-by-kong-cert-sync",
-		fmt.Sprintf("namespace:%s", namespace),
-		fmt.Sprintf("certificate:%s", name),
-		fmt.Sprintf("synced-at:%d", time.Now().Unix()),
-	}
+	tags := []string{}
+	tags = appendKongTag(tags, "managed-by-kong-cert-sync")
+	tags = appendKongTag(tags, fmt.Sprintf("namespace:%s", namespace))
+	tags = appendKongTag(tags, fmt.Sprintf("certificate:%s", name))
+	tags = appendKongTag(tags, fmt.Sprintf("synced-at:%d", time.Now().Unix()))
 
 	if clusterName := c.config.Controller.ClusterName; clusterName != "" {
-		tags = append(tags, fmt.Sprintf("cluster:%s", clusterName))
+		tags = appendKongTag(tags, fmt.Sprintf("cluster:%s", clusterName))
 	}
 
-	for key, value := range cert.Labels {
-		tags = append(tags, fmt.Sprintf("%s:%s", key, value))
+	labelKeys := make([]string, 0, len(cert.Labels))
+	for key := range cert.Labels {
+		if isFluxManagedLabel(key) {
+			klog.V(3).Infof("Skipping Flux managed label in Kong tags: %s", key)
+			continue
+		}
+		labelKeys = append(labelKeys, key)
+	}
+	sort.Strings(labelKeys)
+
+	for _, key := range labelKeys {
+		tags = appendKongTag(tags, fmt.Sprintf("%s:%s", key, cert.Labels[key]))
 	}
 
-	return tags
+	return uniqueStrings(tags)
+}
+
+func appendKongTag(tags []string, rawTag string) []string {
+	tag := sanitizeKongTag(rawTag)
+	if tag == "" {
+		return tags
+	}
+	return append(tags, tag)
+}
+
+func sanitizeKongTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(tag))
+
+	lastWasReplacement := false
+	for _, r := range tag {
+		if isKongTagChar(r) {
+			builder.WriteRune(r)
+			lastWasReplacement = false
+			continue
+		}
+
+		if !lastWasReplacement {
+			builder.WriteRune('-')
+			lastWasReplacement = true
+		}
+	}
+
+	sanitized := strings.Trim(builder.String(), "-")
+	if len(sanitized) > maxKongTagLength {
+		sanitized = strings.Trim(sanitized[:maxKongTagLength], "-")
+	}
+
+	return sanitized
+}
+
+func isKongTagChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9') ||
+		r == '_' ||
+		r == '.' ||
+		r == '~' ||
+		r == ':' ||
+		r == '-'
+}
+
+func isFluxManagedLabel(key string) bool {
+	return strings.Contains(key, ".toolkit.fluxcd.io/")
 }
 
 func (c *CertificateController) deleteCertificateFromKong(namespace, certName string) error {
